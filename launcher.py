@@ -31,6 +31,21 @@ def health():
         status.append(f"{icon} {name}")
     return "<br>".join(["<h2>🤖 Master Bot Launcher</h2>"] + status)
 
+@health_app.route("/tiktok", methods=["GET", "POST"])
+def tiktok_webhook():
+    import tiktok_main as tm
+    return tm.webhook()
+
+@health_app.route("/scanner", methods=["GET", "POST"])
+def scanner_webhook():
+    import scanner_main as sm
+    return sm.webhook()
+
+@health_app.route("/meta", methods=["GET", "POST"])
+def meta_webhook():
+    import meta_main as mm
+    return mm.webhook()
+
 bot_status = {
     "football-bot": False,
     "scalper-bot":  False,
@@ -118,8 +133,10 @@ def start_scalper_bot():
 
 def start_scanner_bot():
     import scanner_main as sm
-    print("[scanner-bot] ✅ Запускаю Flask на порту 10001...")
-    sm.app.run(host="0.0.0.0", port=10001)
+    print("[scanner-bot] ✅ Scanner бот загружен (webhook через главный порт)")
+    # Держим поток живым
+    while True:
+        time.sleep(3600)
 
 # ══════════════════════════════════════════════
 # БОТ 4: NEURO ACADEMY
@@ -140,8 +157,9 @@ def build_neuro_bot():
 
 def start_meta_bot():
     import meta_main as mm
-    print("[meta-bot] ✅ Запускаю Flask на порту 10002...")
-    mm.app.run(host="0.0.0.0", port=10002)
+    print("[meta-bot] ✅ Meta бот загружен (webhook через главный порт)")
+    while True:
+        time.sleep(3600)
 
 # ══════════════════════════════════════════════
 # БОТ 6: TIKTOK GENERATOR (Flask webhook)
@@ -149,8 +167,11 @@ def start_meta_bot():
 
 def start_tiktok_bot():
     import tiktok_main as tm
-    print("[tiktok-bot] ✅ Запускаю Flask на порту 10003...")
-    tm.app.run(host="0.0.0.0", port=10003)
+    print("[tiktok-bot] ✅ TikTok бот загружен (webhook через главный порт)")
+    # Регистрируем webhook
+    tm.set_webhook()
+    while True:
+        time.sleep(3600)
 
 # ══════════════════════════════════════════════
 # ЗАПУСК ВСЕХ БОТОВ
