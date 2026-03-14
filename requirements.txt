@@ -9,7 +9,7 @@ requests==2.31.0
 # (без доп. зависимостей)
 
 # Crypto scalper
-tradingview-ta==3.3.0
+tradingview-ta
 
 # Crypto scanner
 pandas==1.5.3
