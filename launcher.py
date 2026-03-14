@@ -1,5 +1,5 @@
 """
-MASTER LAUNCHER — запускает все 5 ботов в одном Render сервисе
+MASTER LAUNCHER — запускает все 6 ботов в одном Render сервисе
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Боты:
 1. football-telegram-bot  — анализ футбола (PTB polling)
@@ -7,6 +7,7 @@ MASTER LAUNCHER — запускает все 5 ботов в одном Render 
 3. crypto-scanner-bot     — спотовый трейдинг (Flask webhook)
 4. neuro-academy-bot      — курс по нейросетям (PTB polling)
 5. meta-bot               — создаёт других ботов (Flask webhook)
+6. tiktok-bot             — TikTok контент генератор (Flask webhook)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -31,11 +32,12 @@ def health():
     return "<br>".join(["<h2>🤖 Master Bot Launcher</h2>"] + status)
 
 bot_status = {
-    "football-bot":    False,
-    "scalper-bot":     False,
-    "scanner-bot":     False,
-    "neuro-bot":       False,
-    "meta-bot":        False,
+    "football-bot": False,
+    "scalper-bot":  False,
+    "scanner-bot":  False,
+    "neuro-bot":    False,
+    "meta-bot":     False,
+    "tiktok-bot":   False,
 }
 
 # ──────────────────────────────────────────────
@@ -66,7 +68,6 @@ def run_ptb_thread(name, build_func):
             try:
                 print(f"[{name}] ▶ Запускаю PTB бота...")
                 bot_status[name] = True
-                # Каждый PTB бот получает свой event loop
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 ptb_app = build_func()
@@ -143,11 +144,20 @@ def start_meta_bot():
     mm.app.run(host="0.0.0.0", port=10002)
 
 # ══════════════════════════════════════════════
+# БОТ 6: TIKTOK GENERATOR (Flask webhook)
+# ══════════════════════════════════════════════
+
+def start_tiktok_bot():
+    import tiktok_main as tm
+    print("[tiktok-bot] ✅ Запускаю Flask на порту 10003...")
+    tm.app.run(host="0.0.0.0", port=10003)
+
+# ══════════════════════════════════════════════
 # ЗАПУСК ВСЕХ БОТОВ
 # ══════════════════════════════════════════════
 
 def start_all_bots():
-    """Запускает все 5 ботов в отдельных потоках"""
+    """Запускает все 6 ботов в отдельных потоках"""
     print("=" * 60)
     print("🚀 MASTER LAUNCHER — Запускаю все боты...")
     print("=" * 60)
@@ -158,19 +168,19 @@ def start_all_bots():
     try:
         run_ptb_thread("football-bot", build_football_bot)
         bots_started += 1
-        print("[1/5] ✅ Football Bot — запущен")
+        print("[1/6] ✅ Football Bot — запущен")
     except Exception as e:
-        print(f"[1/5] ❌ Football Bot — ошибка: {e}")
+        print(f"[1/6] ❌ Football Bot — ошибка: {e}")
 
-    time.sleep(2)  # Пауза между запусками
+    time.sleep(2)
 
     # Бот 2: Scalper (polling loop)
     try:
         run_thread("scalper-bot", start_scalper_bot)
         bots_started += 1
-        print("[2/5] ✅ Crypto Scalper — запущен")
+        print("[2/6] ✅ Crypto Scalper — запущен")
     except Exception as e:
-        print(f"[2/5] ❌ Crypto Scalper — ошибка: {e}")
+        print(f"[2/6] ❌ Crypto Scalper — ошибка: {e}")
 
     time.sleep(2)
 
@@ -178,9 +188,9 @@ def start_all_bots():
     try:
         run_thread("scanner-bot", start_scanner_bot)
         bots_started += 1
-        print("[3/5] ✅ Crypto Scanner — запущен")
+        print("[3/6] ✅ Crypto Scanner — запущен")
     except Exception as e:
-        print(f"[3/5] ❌ Crypto Scanner — ошибка: {e}")
+        print(f"[3/6] ❌ Crypto Scanner — ошибка: {e}")
 
     time.sleep(2)
 
@@ -188,9 +198,9 @@ def start_all_bots():
     try:
         run_ptb_thread("neuro-bot", build_neuro_bot)
         bots_started += 1
-        print("[4/5] ✅ Neuro Academy — запущен")
+        print("[4/6] ✅ Neuro Academy — запущен")
     except Exception as e:
-        print(f"[4/5] ❌ Neuro Academy — ошибка: {e}")
+        print(f"[4/6] ❌ Neuro Academy — ошибка: {e}")
 
     time.sleep(2)
 
@@ -198,12 +208,22 @@ def start_all_bots():
     try:
         run_thread("meta-bot", start_meta_bot)
         bots_started += 1
-        print("[5/5] ✅ Meta Bot — запущен")
+        print("[5/6] ✅ Meta Bot — запущен")
     except Exception as e:
-        print(f"[5/5] ❌ Meta Bot — ошибка: {e}")
+        print(f"[5/6] ❌ Meta Bot — ошибка: {e}")
+
+    time.sleep(2)
+
+    # Бот 6: TikTok Generator (Flask)
+    try:
+        run_thread("tiktok-bot", start_tiktok_bot)
+        bots_started += 1
+        print("[6/6] ✅ TikTok Bot — запущен")
+    except Exception as e:
+        print(f"[6/6] ❌ TikTok Bot — ошибка: {e}")
 
     print("=" * 60)
-    print(f"✅ Запущено ботов: {bots_started}/5")
+    print(f"✅ Запущено ботов: {bots_started}/6")
     print("=" * 60)
 
 # ══════════════════════════════════════════════
