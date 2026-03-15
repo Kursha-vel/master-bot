@@ -183,7 +183,15 @@ def start_scalper():
 def start_scanner():
     import scanner_main as sm
     print("[scanner-bot] ✅ Запускаю polling loop...")
-    sm.polling_loop()
+    while True:
+        try:
+            sm._polling_running = False  # сбрасываем флаг перед каждым запуском
+            sm.polling_loop()
+        except Exception as e:
+            sm._polling_running = False
+            print(f"[scanner-bot] ❌ Упал: {e}")
+            print("[scanner-bot] ⏳ Рестарт через 60 сек...")
+            time.sleep(60)
 
 # ══════════════════════════════════════════════
 # БОТ 5: META BOT
