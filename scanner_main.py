@@ -1,39 +1,50 @@
+"""
+ULTRA SPOT SCANNER — Binance SPOT торговля
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ТОЛЬКО СПОТ! Никаких фьючерсов и плеча!
+Один качественный сигнал > много слабых
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
 import requests
 import time
 import json
 import threading
 import os
-from flask import Flask, request
 from datetime import datetime, timezone
 
-# ---------------- КОНФИГ ---------------- #
-
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+# ──────────────────────────────────────────
+# КОНФИГ
+# ──────────────────────────────────────────
+TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
-RENDER_URL = os.environ.get("RENDER_URL", "")
 
-app = Flask(__name__)
+SCAN_INTERVAL = 900   # 15 минут
+TAKE_PROFIT   = 10.0  # +10% → сигнал продавать
+STOP_LOSS     = -5.0  # -5%  → стоп-лосс
+MIN_SCORE     = 80    # минимальный балл для сигнала (строгий!)
 
-SCAN_INTERVAL = 300  # каждые 5 минут
-
+# Только SPOT endpoints Binance
 BINANCE_24H    = "https://api.binance.com/api/v3/ticker/24hr"
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 BINANCE_PRICE  = "https://api.binance.com/api/v3/ticker/price"
 BINANCE_DEPTH  = "https://api.binance.com/api/v3/depth"
-COINGECKO_TRENDING = "https://api.coingecko.com/api/v3/search/trending"
+COINGECKO_URL  = "https://api.coingecko.com/api/v3/search/trending"
 
-# УЛУЧШЕНИЕ 6: Blacklist монет
-BLACKLIST = set(["LUNAUSDT", "TERRAUSDT", "USTUSDT"])
+BLACKLIST = set(["LUNAUSDT","TERRAUSDT","USTUSDT","USDTUSDT"])
 
-scanner_running = True
-active_signals = []
-active_signals_time = {}
-tracked_coins = {}   # { symbol: {"entry": price, "peak": price} }
-trade_history = []
-win_count = 0
-loss_count = 0
+# ──────────────────────────────────────────
+# СОСТОЯНИЕ
+# ──────────────────────────────────────────
+scanner_running  = False  # выключен по умолчанию — включаешь сам
+active_position  = None   # { "symbol", "entry", "peak" } — только одна позиция
+signal_history   = []     # история сигналов
+last_update_id   = 0
+scan_lock        = threading.Lock()
 
-# ---------------- TELEGRAM ---------------- #
+# ──────────────────────────────────────────
+# TELEGRAM
+# ──────────────────────────────────────────
 
 def send_message(chat_id, text, buttons=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -43,731 +54,804 @@ def send_message(chat_id, text, buttons=None):
     try:
         requests.post(url, data=payload, timeout=10)
     except Exception as e:
-        print(f"Ошибка отправки: {e}")
+        print(f"[scanner] send error: {e}")
 
-def set_webhook():
-    if not RENDER_URL:
-        print("RENDER_URL не задан!")
-        return
-    url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
+def send_typing(chat_id):
     try:
-        r = requests.post(url, json={"url": RENDER_URL.rstrip("/") + "/scanner"}, timeout=10)
-        print(f"Webhook: {r.json()}")
-    except Exception as e:
-        print(f"Ошибка webhook: {e}")
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendChatAction",
+            data={"chat_id": chat_id, "action": "typing"}, timeout=5
+        )
+    except: pass
 
-# ---------------- ДАННЫЕ ---------------- #
-
-def get_klines(symbol, interval, limit=40):
+def answer_callback(callback_id, text=""):
     try:
-        url = f"{BINANCE_KLINES}?symbol={symbol}&interval={interval}&limit={limit}"
-        data = requests.get(url, timeout=10).json()
-        if not isinstance(data, list) or len(data) < 5:
-            return [], [], [], []
-        highs   = [float(x[2]) for x in data]
-        lows    = [float(x[3]) for x in data]
-        closes  = [float(x[4]) for x in data]
-        volumes = [float(x[5]) for x in data]
-        return closes, volumes, highs, lows
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_id, "text": text}, timeout=5
+        )
+    except: pass
+
+def get_updates():
+    global last_update_id
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TOKEN}/getUpdates",
+            params={"offset": last_update_id + 1, "timeout": 10},
+            timeout=15
+        )
+        data = r.json()
+        if data.get("ok"):
+            return data.get("result", [])
     except Exception as e:
-        print(f"Ошибка klines {symbol}: {e}")
-        return [], [], [], []
+        print(f"[scanner] getUpdates error: {e}")
+    return []
+
+def delete_webhook():
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
+            json={"drop_pending_updates": True}, timeout=10
+        )
+        print(f"[scanner] deleteWebhook: {r.json().get('description','ok')}")
+    except Exception as e:
+        print(f"[scanner] deleteWebhook error: {e}")
+
+# ──────────────────────────────────────────
+# РЫНОЧНЫЕ ДАННЫЕ (ТОЛЬКО SPOT API)
+# ──────────────────────────────────────────
+
+def get_klines(symbol, interval, limit=50):
+    """Получаем свечи с Binance SPOT /api/v3"""
+    try:
+        r = requests.get(
+            f"{BINANCE_KLINES}",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=10
+        )
+        data = r.json()
+        if not isinstance(data, list) or len(data) < 10:
+            return None
+        return {
+            "opens":   [float(x[1]) for x in data],
+            "highs":   [float(x[2]) for x in data],
+            "lows":    [float(x[3]) for x in data],
+            "closes":  [float(x[4]) for x in data],
+            "volumes": [float(x[5]) for x in data],
+        }
+    except:
+        return None
+
+def get_price(symbol):
+    try:
+        r = requests.get(f"{BINANCE_PRICE}", params={"symbol": symbol}, timeout=5)
+        return float(r.json()["price"])
+    except:
+        return None
 
 def get_top_pairs():
+    """Топ SPOT пары по объёму — исключаем стейблкоины и проблемные токены"""
     try:
         data = requests.get(BINANCE_24H, timeout=10).json()
-    except Exception as e:
-        print(f"Ошибка пар: {e}")
+    except:
         return []
+
     pairs = []
+    STABLES = {"BUSD","USDC","TUSD","USDP","DAI","FDUSD","UST","USDD"}
     for coin in data:
-        symbol = coin["symbol"]
-        if not symbol.endswith("USDT"):
-            continue
-        if any(s in symbol for s in ["BUSD", "USDC", "TUSD", "USDP", "DAI", "FDUSD"]):
-            continue
-        if symbol in BLACKLIST:
-            continue
-        volume = float(coin["quoteVolume"])
+        sym = coin["symbol"]
+        if not sym.endswith("USDT"): continue
+        base = sym.replace("USDT","")
+        if base in STABLES: continue
+        if sym in BLACKLIST: continue
+        # Фильтр: хороший объём, не перегрета
+        vol    = float(coin["quoteVolume"])
         change = float(coin["priceChangePercent"])
-        if volume < 25_000_000:
-            continue
-        if change > 8:
-            continue
-        pairs.append((symbol, volume))
+        if vol < 10_000_000: continue   # минимум $10М объёма
+        if change > 15: continue        # не берём уже улетевшие
+        if change < -15: continue       # и сильно падающие
+        pairs.append((sym, vol, change))
+
     pairs.sort(key=lambda x: x[1], reverse=True)
-    return [p[0] for p in pairs[:150]]
+    return [p[0] for p in pairs[:100]]  # топ 100
 
-# ---------------- УЛУЧШЕНИЕ 3: BTC ФИЛЬТР ---------------- #
-
-def get_btc_trend():
+def get_trending():
     try:
-        closes, _, _, _ = get_klines("BTCUSDT", "1h")
-        if not closes or len(closes) < 6:
-            return "neutral"
-        change = (closes[-1] - closes[-6]) / closes[-6] * 100
-        if change <= -2:
-            return "down"
-        if change >= 1:
-            return "up"
-        return "neutral"
+        data = requests.get(COINGECKO_URL, timeout=10).json()
+        return set(c["item"]["symbol"].upper()+"USDT" for c in data.get("coins",[]))
     except:
-        return "neutral"
+        return set()
 
-def check_btc_crash():
-    try:
-        closes, _, _, _ = get_klines("BTCUSDT", "15m")
-        if not closes or len(closes) < 5:
-            return False
-        drop = (closes[-1] - closes[-5]) / closes[-5] * 100
-        return drop <= -3
-    except:
-        return False
-
-# ---------------- УЛУЧШЕНИЕ 5: ВРЕМЯ СУТОК ---------------- #
-
-def is_active_hours():
-    hour = datetime.now(timezone.utc).hour
-    return 14 <= hour <= 22
-
-# ---------------- УЛУЧШЕНИЕ 8: TRENDING МОНЕТЫ ---------------- #
-
-def get_trending_symbols():
-    try:
-        data = requests.get(COINGECKO_TRENDING, timeout=10).json()
-        return [coin["item"]["symbol"].upper() + "USDT" for coin in data.get("coins", [])]
-    except:
-        return []
-
-# ---------------- ИНДИКАТОРЫ ---------------- #
+# ──────────────────────────────────────────
+# ИНДИКАТОРЫ
+# ──────────────────────────────────────────
 
 def calc_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50
+    if len(closes) < period+1: return 50.0
     gains, losses = [], []
     for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    ag = sum(gains[-period:]) / period
+    al = sum(losses[-period:]) / period
+    if al == 0: return 100.0
+    return round(100 - 100/(1 + ag/al), 1)
+
+def calc_ema(closes, n):
+    if len(closes) < n: return closes[-1]
+    k = 2/(n+1)
+    ema = closes[0]
+    for p in closes[1:]: ema = p*k + ema*(1-k)
+    return ema
 
 def calc_macd(closes):
-    if len(closes) < 26:
-        return False
-    def ema(data, n):
-        k = 2 / (n + 1)
-        result = [data[0]]
-        for price in data[1:]:
-            result.append(price * k + result[-1] * (1 - k))
-        return result
-    ema12 = ema(closes, 12)
-    ema26 = ema(closes, 26)
-    macd = [ema12[i] - ema26[i] for i in range(len(ema26))]
-    return macd[-2] < 0 and macd[-1] > 0
+    """Возвращает (macd_val, signal_val, crossover_up)"""
+    if len(closes) < 26: return 0, 0, False
+    ema12 = calc_ema(closes[-26:], 12)
+    ema26 = calc_ema(closes[-26:], 26)
+    macd  = ema12 - ema26
+    # Предыдущий MACD
+    ema12p = calc_ema(closes[-27:-1], 12) if len(closes) >= 27 else ema12
+    ema26p = calc_ema(closes[-27:-1], 26) if len(closes) >= 27 else ema26
+    macd_prev = ema12p - ema26p
+    crossover = macd_prev < 0 and macd > 0
+    return round(macd,6), round(macd-macd_prev,6), crossover
 
-def whale_tracker(volumes):
-    if len(volumes) < 2:
-        return 0
-    avg = sum(volumes[:-1]) / len(volumes[:-1])
-    if avg == 0:
-        return 0
-    return volumes[-1] / avg
-
-def hidden_accumulation(closes, volumes):
-    if len(closes) < 10 or len(volumes) < 10:
-        return False
-    price_change = abs(closes[-1] - closes[0]) / closes[0] * 100
-    first_vol = sum(volumes[:10]) / 10
-    last_vol  = sum(volumes[-10:]) / 10
-    if first_vol == 0:
-        return False
-    return price_change < 2 and last_vol > first_vol * 1.4
-
-def pre_pump_detector(closes):
-    if len(closes) < 4 or closes[-4] == 0:
-        return False
-    momentum = (closes[-1] - closes[-4]) / closes[-4] * 100
-    return 0.5 < momentum < 4
-
-def orderbook_pressure(symbol):
-    try:
-        data = requests.get(f"{BINANCE_DEPTH}?symbol={symbol}&limit=50", timeout=10).json()
-        bids = sum(float(b[1]) for b in data.get("bids", []))
-        asks = sum(float(a[1]) for a in data.get("asks", []))
-        return bids / asks if asks > 0 else 0
-    except:
-        return 0
-
-# УЛУЧШЕНИЕ 1: МНОГОТАЙМФРЕЙМНЫЙ АНАЛИЗ
-def multi_timeframe_trend(symbol):
-    score = 0
-    for interval in ["15m", "1h", "4h"]:
-        try:
-            closes, _, _, _ = get_klines(symbol, interval, limit=20)
-            if closes and len(closes) >= 5:
-                trend = (closes[-1] - closes[0]) / closes[0] * 100
-                if trend > 0:
-                    score += 1
-        except:
-            pass
-    return score  # 0-3
-
-# SUPERTREND
-def calc_supertrend(highs, lows, closes, period=10, multiplier=3.0):
-    """Supertrend — популярный индикатор тренда с TradingView"""
-    if len(closes) < period + 1:
-        return "neutral"
-    # ATR
-    tr_list = []
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i-1]),
-            abs(lows[i] - closes[i-1])
-        )
-        tr_list.append(tr)
-    if len(tr_list) < period:
-        return "neutral"
-    atr = sum(tr_list[-period:]) / period
-    # Basic bands
-    hl2 = [(highs[i] + lows[i]) / 2 for i in range(len(closes))]
-    upper = hl2[-1] + multiplier * atr
-    lower = hl2[-1] - multiplier * atr
-    # Определяем направление
-    if closes[-1] > lower:
-        return "up"    # цена выше нижней полосы = восходящий тренд
-    elif closes[-1] < upper:
-        return "down"  # цена ниже верхней полосы = нисходящий тренд
+def calc_supertrend(highs, lows, closes, period=10, mult=3.0):
+    if len(closes) < period+1: return "neutral"
+    tr_vals = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+               for i in range(1,len(closes))]
+    atr = sum(tr_vals[-period:]) / period
+    hl2 = (highs[-1]+lows[-1]) / 2
+    upper = hl2 + mult*atr
+    lower = hl2 - mult*atr
+    if closes[-1] > lower: return "up"
+    if closes[-1] < upper: return "down"
     return "neutral"
 
-# VWAP
-def calc_vwap(closes, volumes):
-    """VWAP — средневзвешенная цена по объёму"""
-    if not closes or not volumes or len(closes) != len(volumes):
-        return None
-    total_pv = sum(closes[i] * volumes[i] for i in range(len(closes)))
-    total_v  = sum(volumes)
-    if total_v == 0:
-        return None
-    return total_pv / total_v
+def calc_vwap(klines):
+    closes  = klines["closes"]
+    highs   = klines["highs"]
+    lows    = klines["lows"]
+    volumes = klines["volumes"]
+    if not volumes or sum(volumes)==0: return None
+    tp = [(highs[i]+lows[i]+closes[i])/3 for i in range(len(closes))]
+    return sum(tp[i]*volumes[i] for i in range(len(closes))) / sum(volumes)
 
-# SUPPORT / RESISTANCE
-def calc_support_resistance(closes, highs, lows):
-    """Автоматические уровни поддержки и сопротивления"""
-    if len(closes) < 10:
-        return None, None
-    support    = min(lows[-10:])
-    resistance = max(highs[-10:])
-    return support, resistance
+def calc_bollinger(closes, period=20, std_mult=2):
+    if len(closes) < period: return None, None, None
+    sma  = sum(closes[-period:]) / period
+    std  = (sum((c-sma)**2 for c in closes[-period:]) / period) ** 0.5
+    return sma, sma + std_mult*std, sma - std_mult*std
 
-# ---------------- АНАЛИЗ ---------------- #
+def volume_spike(volumes):
+    if len(volumes) < 10: return 1.0
+    avg = sum(volumes[-11:-1]) / 10
+    return round(volumes[-1]/avg, 1) if avg > 0 else 1.0
 
-def analyze(symbol, trending_symbols):
-    closes5,  vol5,  highs5,  lows5  = get_klines(symbol, "5m")
-    closes15, vol15, highs15, lows15 = get_klines(symbol, "15m")
-
-    if not closes5 or not vol5 or not closes15 or not highs15 or not lows15:
-        return 0, {}
-
-    whale        = whale_tracker(vol5)
-    accumulation = hidden_accumulation(closes5, vol5)
-    pre_pump     = pre_pump_detector(closes5)
-    pressure     = orderbook_pressure(symbol)
-    trend15      = (closes15[-1] - closes15[0]) / closes15[0] * 100
-    rsi          = calc_rsi(closes15)
-    macd_cross   = calc_macd(closes15)
-    mtf_score    = multi_timeframe_trend(symbol)
-    is_trending  = symbol in trending_symbols
-    # Новые индикаторы TradingView уровня
-    supertrend   = calc_supertrend(highs15, lows15, closes15)
-    vwap         = calc_vwap(closes15, vol15)
-    support, resistance = calc_support_resistance(closes15, highs15, lows15)
-    price_now    = closes15[-1]
-    above_vwap   = vwap is not None and price_now > vwap
-    near_support = support is not None and abs(price_now - support) / price_now < 0.02
-
-    # УЛУЧШЕНИЕ 2: малые монеты
-    is_small_cap = False
+def orderbook_ratio(symbol):
     try:
-        ticker = requests.get(f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}", timeout=5).json()
-        vol_usd = float(ticker.get("quoteVolume", 0))
-        is_small_cap = 1_000_000 < vol_usd < 20_000_000
+        data = requests.get(f"{BINANCE_DEPTH}", params={"symbol":symbol,"limit":20}, timeout=8).json()
+        bids = sum(float(b[1]) for b in data.get("bids",[]))
+        asks = sum(float(a[1]) for a in data.get("asks",[]))
+        return round(bids/asks, 2) if asks > 0 else 1.0
     except:
-        pass
+        return 1.0
 
-    score = 0
+# ──────────────────────────────────────────
+# МЕГА-АНАЛИЗ — СТРОГИЙ ФИЛЬТР
+# ──────────────────────────────────────────
 
-    if whale > 2:        score += 25
-    if whale > 3:        score += 15
-    if accumulation:     score += 20
-    if pre_pump:         score += 15
-    if pressure > 1.3:   score += 15
-    if trend15 > 0:      score += 5
-    if rsi < 30:         score += 25
-    elif rsi < 40:       score += 15
-    elif rsi > 70:       score -= 20
-    if macd_cross:       score += 20
-    score += mtf_score * 10
-    if is_small_cap:     score += 10
-    if is_trending:      score += 15
-    # Supertrend
-    if supertrend == "up":    score += 25   # сильный сигнал тренда
-    elif supertrend == "down": score -= 20  # против тренда — штраф
-    # VWAP
-    if above_vwap:       score += 15   # цена выше VWAP = бычий сигнал
-    # Поддержка
-    if near_support:     score += 15   # цена у поддержки = хорошая точка входа
+def analyze_coin(symbol, trending):
+    """
+    Комплексный анализ монеты.
+    Возвращает (score, report) или (0, None) если данных нет.
+    Высокий порог MIN_SCORE=80 — только лучшие сигналы!
+    """
+    # Получаем данные на разных таймфреймах
+    k15m = get_klines(symbol, "15m", 50)
+    k1h  = get_klines(symbol, "1h",  50)
+    k4h  = get_klines(symbol, "4h",  30)
 
-    details = {
-        "rsi":        round(rsi, 1),
-        "macd":       macd_cross,
-        "whale":      round(whale, 1),
-        "pressure":   round(pressure, 2),
-        "mtf":        mtf_score,
-        "trending":   is_trending,
-        "supertrend": supertrend,
-        "vwap":       round(vwap, 6) if vwap else None,
-        "above_vwap": above_vwap,
-        "support":    round(support, 6) if support else None,
-        "near_support": near_support,
+    if not k15m or not k1h:
+        return 0, None
+
+    c15 = k15m["closes"]
+    c1h = k1h["closes"]
+    c4h = k4h["closes"] if k4h else c1h
+
+    score   = 0
+    reasons = []
+    warns   = []
+
+    # ── 1. RSI (14) на 1ч ─────────────────────
+    rsi = calc_rsi(c1h)
+    if rsi < 30:
+        score += 25
+        reasons.append(f"RSI {rsi} 🟢 сильно перепродан")
+    elif rsi < 40:
+        score += 15
+        reasons.append(f"RSI {rsi} 🟡 перепродан")
+    elif rsi > 70:
+        score -= 25
+        warns.append(f"RSI {rsi} 🔴 перекуплен")
+    else:
+        reasons.append(f"RSI {rsi} нейтральный")
+
+    # ── 2. MACD на 1ч ─────────────────────────
+    macd_val, macd_diff, macd_cross = calc_macd(c1h)
+    if macd_cross:
+        score += 20
+        reasons.append("MACD ✅ пересечение вверх")
+    elif macd_val > 0:
+        score += 8
+        reasons.append("MACD 🟡 положительный")
+    else:
+        warns.append("MACD ➖ отрицательный")
+
+    # ── 3. Supertrend на 1ч ───────────────────
+    st = calc_supertrend(k1h["highs"], k1h["lows"], c1h)
+    if st == "up":
+        score += 20
+        reasons.append("Supertrend 🟢 вверх")
+    elif st == "down":
+        score -= 20
+        warns.append("Supertrend 🔴 вниз")
+
+    # ── 4. EMA тренд (50 > 200 = бычий) ──────
+    ema20 = calc_ema(c1h, 20)
+    ema50 = calc_ema(c1h, 50)
+    price = c1h[-1]
+    if price > ema20 > ema50:
+        score += 15
+        reasons.append("EMA ✅ цена > EMA20 > EMA50")
+    elif price < ema20:
+        score -= 10
+        warns.append("EMA ⬇️ цена ниже EMA20")
+
+    # ── 5. VWAP ───────────────────────────────
+    vwap = calc_vwap(k1h)
+    if vwap and price > vwap:
+        score += 15
+        reasons.append(f"VWAP ✅ цена выше ({round(vwap,4)})")
+    elif vwap and price < vwap:
+        score -= 8
+        warns.append(f"VWAP ⬇️ цена ниже ({round(vwap,4)})")
+
+    # ── 6. Bollinger Bands ────────────────────
+    bb_mid, bb_up, bb_low = calc_bollinger(c1h)
+    if bb_low and price <= bb_low * 1.01:
+        score += 20
+        reasons.append("Bollinger 🟢 цена у нижней полосы")
+    elif bb_up and price >= bb_up * 0.99:
+        score -= 15
+        warns.append("Bollinger 🔴 цена у верхней полосы")
+
+    # ── 7. Объём — спайк ──────────────────────
+    vol_spike = volume_spike(k15m["volumes"])
+    if vol_spike >= 2.5:
+        score += 20
+        reasons.append(f"Объём 🐋 x{vol_spike} спайк!")
+    elif vol_spike >= 1.5:
+        score += 10
+        reasons.append(f"Объём ✅ x{vol_spike}")
+    elif vol_spike < 0.7:
+        score -= 5
+        warns.append(f"Объём ⬇️ x{vol_spike} низкий")
+
+    # ── 8. Стакан ─────────────────────────────
+    ob = orderbook_ratio(symbol)
+    if ob >= 1.5:
+        score += 15
+        reasons.append(f"Стакан 💰 покупатели x{ob}")
+    elif ob >= 1.2:
+        score += 8
+        reasons.append(f"Стакан ✅ перевес покупок x{ob}")
+    elif ob < 0.8:
+        score -= 10
+        warns.append(f"Стакан ⬇️ продавцы x{ob}")
+
+    # ── 9. Многотаймфреймный тренд ────────────
+    mtf = 0
+    for closes_tf, name in [(c15, "15м"), (c1h, "1ч"), (c4h, "4ч")]:
+        if len(closes_tf) >= 5:
+            if closes_tf[-1] > closes_tf[-5]:
+                mtf += 1
+    if mtf == 3:
+        score += 20
+        reasons.append("МТФ 🟢 все 3 таймфрейма вверх")
+    elif mtf == 2:
+        score += 10
+        reasons.append(f"МТФ 🟡 {mtf}/3 таймфрейма вверх")
+    else:
+        warns.append(f"МТФ ⚠️ только {mtf}/3 вверх")
+
+    # ── 10. CoinGecko trending ────────────────
+    if symbol in trending:
+        score += 15
+        reasons.append("CoinGecko 🔥 Trending монета!")
+
+    # ── Итог ─────────────────────────────────
+    report = {
+        "symbol":    symbol,
+        "price":     round(price, 8),
+        "score":     score,
+        "rsi":       rsi,
+        "macd":      macd_cross,
+        "supertrend": st,
+        "vwap":      round(vwap,4) if vwap else None,
+        "vol_spike": vol_spike,
+        "ob_ratio":  ob,
+        "mtf":       mtf,
+        "trending":  symbol in trending,
+        "reasons":   reasons,
+        "warns":     warns,
     }
-    return score, details
+    return score, report
 
-# ---------------- СИГНАЛ ---------------- #
+# ──────────────────────────────────────────
+# ФОРМАТ СИГНАЛА
+# ──────────────────────────────────────────
 
-def send_signal(symbol, price, score, details):
-    if score >= 100:   strength = "🔥🔥🔥 ОЧЕНЬ СИЛЬНЫЙ"
-    elif score >= 75:  strength = "🔥🔥 СИЛЬНЫЙ"
-    else:              strength = "🔥 СРЕДНИЙ"
+def format_signal(report):
+    sym   = report["symbol"]
+    price = report["price"]
+    score = report["score"]
+    tp    = round(price * (1 + TAKE_PROFIT/100), 8)
+    sl    = round(price * (1 + STOP_LOSS/100), 8)
 
-    rsi_text   = f"{details['rsi']} {'🟢 перепродана' if details['rsi'] < 40 else '🟡 норма'}"
-    macd_text  = "✅ Да" if details["macd"] else "➖ Нет"
-    whale_text = f"x{details['whale']} {'🐋' if details['whale'] > 3 else ''}"
-    press_text = f"{details['pressure']} {'✅' if details['pressure'] > 1.3 else '➖'}"
-    mtf_text   = f"{details['mtf']}/3 таймфреймов вверх"
-    trend_text = "🔥 Trending!" if details["trending"] else "➖"
-    st_emoji   = "🟢 Вверх" if details["supertrend"] == "up" else ("🔴 Вниз" if details["supertrend"] == "down" else "🟡 Нейтрально")
-    vwap_text  = f"{details['vwap']} {'✅ Выше VWAP' if details['above_vwap'] else '⬇️ Ниже VWAP'}" if details["vwap"] else "➖"
-    sup_text   = f"{details['support']} {'🎯 Цена у поддержки!' if details['near_support'] else ''}" if details["support"] else "➖"
+    if score >= 110:   strength = "💎 ИСКЛЮЧИТЕЛЬНЫЙ"
+    elif score >= 95:  strength = "🔥🔥🔥 ОЧЕНЬ СИЛЬНЫЙ"
+    elif score >= 80:  strength = "🔥🔥 СИЛЬНЫЙ"
+    else:              strength = "🔥 ХОРОШИЙ"
+
+    reasons_text = "\n".join(f"  ✅ {r}" for r in report["reasons"])
+    warns_text   = "\n".join(f"  ⚠️ {w}" for w in report["warns"]) if report["warns"] else "  Нет предупреждений"
 
     text = f"""
-🚨 <b>СИГНАЛ ПОКУПКИ (СПОТ)</b>
+🚨 <b>СИГНАЛ ПОКУПКИ — СПОТ</b> 🚨
 
-Монета: <b>{symbol}</b>
+Монета: <b>{sym}</b>
 Цена входа: <b>{price} USDT</b>
-Стоп-лосс: <b>{round(price * 0.95, 8)} USDT (-5%)</b>
-Цель: <b>{round(price * 1.12, 8)} USDT (+12%)</b>
 
-📊 <b>Базовый анализ:</b>
-• RSI: {rsi_text}
-• MACD crossover: {macd_text}
-• Объём кита: {whale_text}
-• Давление стакана: {press_text}
-• Тренд МТФ: {mtf_text}
-• CoinGecko: {trend_text}
+🎯 Цель: <b>{tp} USDT (+{TAKE_PROFIT}%)</b>
+🛑 Стоп-лосс: <b>{sl} USDT ({STOP_LOSS}%)</b>
 
-📈 <b>TradingView индикаторы:</b>
-• Supertrend: {st_emoji}
-• VWAP: {vwap_text}
-• Поддержка: {sup_text}
+📊 <b>Качество сигнала: {score} баллов</b>
+{strength}
 
-AI Score: <b>{score}</b>
-Сила сигнала: {strength}
+✅ <b>Факторы ЗА:</b>
+{reasons_text}
 
-⚠️ Только спотовая торговля!
+⚠️ <b>Риски:</b>
+{warns_text}
+
+⚠️ <b>ТОЛЬКО СПОТОВАЯ ТОРГОВЛЯ!</b>
+Никаких фьючерсов и плеча!
 """
-    buttons = [[
-        {"text": "✅ Купил", "callback_data": f"buy_{symbol}"},
-        {"text": "❌ Пропустить", "callback_data": f"skip_{symbol}"}
-    ]]
-    send_message(OWNER_ID, text, buttons)
+    return text
 
-# ---------------- СКАНЕР ---------------- #
+# ──────────────────────────────────────────
+# СКАНЕР РЫНКА
+# ──────────────────────────────────────────
 
-def scanner():
-    global scanner_running, active_signals, active_signals_time
-    last_clear = time.time()
-    last_btc_alert = 0
+def scan_market():
+    """
+    Сканирует рынок и находит ОДИН лучший сигнал.
+    Строгий фильтр — MIN_SCORE=80.
+    """
+    global scanner_running
+
+    # Проверка BTC тренда
+    btc_klines = get_klines("BTCUSDT", "1h", 20)
+    btc_trend  = "neutral"
+    if btc_klines:
+        btc_closes = btc_klines["closes"]
+        btc_change = (btc_closes[-1] - btc_closes[-6]) / btc_closes[-6] * 100
+        if btc_change <= -3:
+            btc_trend = "down"
+            send_message(OWNER_ID,
+                "⚠️ <b>BTC падает сильно!</b>\n"
+                f"Изменение: {round(btc_change,1)}%\n"
+                "Сканирование приостановлено до стабилизации."
+            )
+            return
+        elif btc_change >= 1:
+            btc_trend = "up"
+
+    send_message(OWNER_ID,
+        f"🔍 <b>Сканирую рынок...</b>\n"
+        f"BTC тренд: {'🟢 Растёт' if btc_trend=='up' else '🟡 Нейтральный'}\n"
+        f"Ищу лучшую монету для покупки..."
+    )
+
+    pairs    = get_top_pairs()
+    trending = get_trending()
+
+    if not pairs:
+        send_message(OWNER_ID, "❌ Не удалось получить данные с Binance. Попробую позже.")
+        return
+
+    print(f"[scanner] Анализирую {len(pairs)} пар...")
+    candidates = []
+
+    for symbol in pairs:
+        try:
+            score, report = analyze_coin(symbol, trending)
+            if score >= MIN_SCORE:
+                candidates.append((score, report))
+                print(f"[scanner] ✅ {symbol}: {score} баллов")
+        except Exception as e:
+            print(f"[scanner] {symbol} error: {e}")
+            continue
+
+    if not candidates:
+        send_message(OWNER_ID,
+            "🔍 <b>Сканирование завершено</b>\n\n"
+            f"Проверено пар: {len(pairs)}\n"
+            f"Сигналов: 0\n\n"
+            "Ни одна монета не прошла все фильтры.\n"
+            f"Следующее сканирование через {SCAN_INTERVAL//60} минут."
+        )
+        return
+
+    # Сортируем по score — берём лучший
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_report = candidates[0]
+
+    # Сохраняем в историю
+    signal_history.append({
+        "symbol": best_report["symbol"],
+        "price":  best_report["price"],
+        "score":  best_score,
+        "time":   datetime.now().strftime("%d.%m %H:%M"),
+    })
+    if len(signal_history) > 20:
+        signal_history.pop(0)
+
+    # Отправляем сигнал
+    text = format_signal(best_report)
+    send_message(OWNER_ID, text, buttons=[[
+        {"text": "✅ Купил!", "callback_data": f"buy_{best_report['symbol']}_{best_report['price']}"},
+        {"text": "❌ Отклонить", "callback_data": f"skip_{best_report['symbol']}"},
+    ]])
+
+    # Если есть второй хороший сигнал — тоже показываем
+    if len(candidates) > 1:
+        second_score, second_report = candidates[1]
+        if second_score >= MIN_SCORE + 10:  # только если значительно лучше порога
+            text2 = format_signal(second_report)
+            send_message(OWNER_ID,
+                f"📊 <b>Альтернативный сигнал (#{2}):</b>",
+            )
+            send_message(OWNER_ID, text2, buttons=[[
+                {"text": "✅ Купил!", "callback_data": f"buy_{second_report['symbol']}_{second_report['price']}"},
+                {"text": "❌ Отклонить", "callback_data": f"skip_{second_report['symbol']}"},
+            ]])
+
+# ──────────────────────────────────────────
+# ТРЕКЕР ПОЗИЦИИ
+# ──────────────────────────────────────────
+
+def track_position():
+    """Следит за открытой позицией и шлёт сигнал продажи"""
+    global active_position
 
     while True:
-        print("Scanner loop...")
-
-        # УЛУЧШЕНИЕ 10: уведомление о резком падении BTC
-        if check_btc_crash():
-            now = time.time()
-            if now - last_btc_alert > 3600:
-                last_btc_alert = now
-                send_message(OWNER_ID, "⚠️ <b>ВНИМАНИЕ!</b>\n\nBTC резко упал на 3%+!\nБудь осторожен с позициями!")
-
-        if time.time() - last_clear > 7200:
-            active_signals.clear()
-            active_signals_time.clear()
-            last_clear = time.time()
-            print("Active signals очищены")
-
-        if scanner_running:
-            # УЛУЧШЕНИЕ 3: BTC тренд
-            btc_trend = get_btc_trend()
-            if btc_trend == "down":
-                print("BTC падает — пропускаем скан")
-                time.sleep(SCAN_INTERVAL)
-                continue
-
-            # УЛУЧШЕНИЕ 5: активные часы
-            if not is_active_hours():
-                print("Нет активных часов (14-22 UTC)")
-                time.sleep(SCAN_INTERVAL)
-                continue
-
-            print(f"Сканирую... BTC: {btc_trend}")
-
+        if active_position:
             try:
-                pairs    = get_top_pairs()
-                trending = get_trending_symbols()
-                print(f"Пар: {len(pairs)}, Trending: {len(trending)}")
+                sym    = active_position["symbol"]
+                entry  = active_position["entry"]
+                peak   = active_position.get("peak", entry)
+                price  = get_price(sym)
 
-                candidates = []
-                for symbol in pairs:
-                    if symbol in BLACKLIST:
-                        continue
-                    try:
-                        score, details = analyze(symbol, trending)
-                        if score > 60:
-                            price = float(requests.get(
-                                f"{BINANCE_PRICE}?symbol={symbol}", timeout=10
-                            ).json()["price"])
-                            candidates.append((symbol, price, score, details))
-                    except Exception as e:
-                        print(f"Ошибка {symbol}: {e}")
-                        continue
+                if price is None:
+                    time.sleep(60)
+                    continue
 
-                candidates.sort(key=lambda x: x[2], reverse=True)
-                signals = candidates[:2]
-                print(f"Кандидатов: {len(candidates)}, сигналов: {len(signals)}")
-
-                for s in signals:
-                    if s[0] not in active_signals:
-                        active_signals.append(s[0])
-                        active_signals_time[s[0]] = time.time()
-                        send_signal(*s)
-
-            except Exception as e:
-                print(f"Ошибка сканера: {e}")
-
-        time.sleep(SCAN_INTERVAL)
-
-# ---------------- ТРЕКЕР ПРИБЫЛИ ---------------- #
-
-def tracker():
-    global win_count, loss_count
-
-    while True:
-        for symbol in list(tracked_coins.keys()):
-            try:
-                data   = tracked_coins[symbol]
-                entry  = data["entry"]
-                peak   = data.get("peak", entry)
-
-                price  = float(requests.get(
-                    f"{BINANCE_PRICE}?symbol={symbol}", timeout=10
-                ).json()["price"])
-
-                profit = (price - entry) / entry * 100
-
-                # УЛУЧШЕНИЕ 7: обновляем пик и трейлинг стоп
+                # Обновляем пик
                 if price > peak:
-                    tracked_coins[symbol]["peak"] = price
+                    active_position["peak"] = price
                     peak = price
 
+                profit     = (price - entry) / entry * 100
                 peak_profit = (peak - entry) / entry * 100
-                if peak_profit >= 5:
-                    dynamic_stop = peak * 0.97
-                    if price <= dynamic_stop:
-                        locked = (price - entry) / entry * 100
-                        text = f"""
-🔒 <b>ТРЕЙЛИНГ СТОП (СПОТ)</b>
 
-Монета: <b>{symbol}</b>
-Вход: {entry} USDT
-Пик: {round(peak, 8)} USDT
-Цена сейчас: <b>{price} USDT</b>
+                print(f"[tracker] {sym}: {round(profit,2)}% (пик: {round(peak_profit,2)}%)")
 
-Зафиксировано: <b>+{round(locked, 2)}%</b> 💰
-Рекомендую продать!
-"""
-                        buttons = [[{"text": "💰 Продал", "callback_data": f"sold_{symbol}"}]]
-                        send_message(OWNER_ID, text, buttons)
-                        time.sleep(300)
-                        continue
+                # Трейлинг стоп: если выросла на 5%+ и откатила на 3% от пика
+                if peak_profit >= 5 and price <= peak * 0.97:
+                    locked = round((price-entry)/entry*100, 2)
+                    send_message(OWNER_ID, f"""🔒 <b>ТРЕЙЛИНГ СТОП!</b>
 
-                if profit >= 12:
-                    text = f"""
-💰 <b>СИГНАЛ ПРОДАЖИ (СПОТ)</b>
+Монета: <b>{sym}</b>
+Цена входа: {entry}
+Пик цены: {round(peak,8)}
+Сейчас: <b>{price}</b>
 
-Монета: <b>{symbol}</b>
-Цена входа: {entry} USDT
-Цена сейчас: <b>{price} USDT</b>
+Зафиксировано: <b>+{locked}%</b>
+Рекомендую продать!""",
+                    buttons=[[{"text":"💰 Продал по трейлингу","callback_data":f"sold_{sym}_{price}"}]])
 
-Прибыль: <b>+{round(profit, 2)}%</b> 🎉
-"""
-                    buttons = [[{"text": "💰 Продал", "callback_data": f"sold_{symbol}"}]]
-                    send_message(OWNER_ID, text, buttons)
+                # Цель достигнута +10%
+                elif profit >= TAKE_PROFIT:
+                    send_message(OWNER_ID, f"""💰 <b>ЦЕЛЬ ДОСТИГНУТА!</b>
 
-                elif profit <= -5:
-                    text = f"""
-🛑 <b>СТОП-ЛОСС (СПОТ)</b>
+Монета: <b>{sym}</b>
+Цена входа: {entry}
+Сейчас: <b>{price}</b>
 
-Монета: <b>{symbol}</b>
-Цена входа: {entry} USDT
-Цена сейчас: <b>{price} USDT</b>
+Прибыль: <b>+{round(profit,2)}%</b> 🎉
 
-Убыток: <b>{round(profit, 2)}%</b>
-Рекомендую продать сейчас!
-"""
-                    buttons = [[{"text": "🛑 Продал", "callback_data": f"sold_{symbol}"}]]
-                    send_message(OWNER_ID, text, buttons)
+Рекомендую продать!""",
+                    buttons=[[{"text":f"💰 Продал +{round(profit,1)}%","callback_data":f"sold_{sym}_{price}"}]])
+
+                # Стоп-лосс -5%
+                elif profit <= STOP_LOSS:
+                    send_message(OWNER_ID, f"""🛑 <b>СТОП-ЛОСС!</b>
+
+Монета: <b>{sym}</b>
+Цена входа: {entry}
+Сейчас: <b>{price}</b>
+
+Убыток: <b>{round(profit,2)}%</b>
+Продай сейчас чтобы не потерять больше!""",
+                    buttons=[[{"text":f"🛑 Продал {round(profit,1)}%","callback_data":f"sold_{sym}_{price}"}]])
 
             except Exception as e:
-                print(f"Ошибка трекера {symbol}: {e}")
+                print(f"[tracker] error: {e}")
 
         time.sleep(60)
 
-# ---------------- WEBHOOK ---------------- #
+# ──────────────────────────────────────────
+# СКАНЕР ЦИКЛ
+# ──────────────────────────────────────────
 
-@app.route("/scanner", methods=["GET", "POST"])
-def webhook():
-    if request.method == "GET":
-        return "✅ Ultra Spot Scanner работает!"
+def scanner_cycle():
+    """Основной цикл сканирования"""
+    global scanner_running
 
-    try:
-        data = request.json
-    except:
-        return "ok"
+    while True:
+        if scanner_running and not active_position:
+            try:
+                with scan_lock:
+                    scan_market()
+            except Exception as e:
+                print(f"[scanner_cycle] error: {e}")
+                send_message(OWNER_ID, f"❌ Ошибка сканирования: {e}")
 
-    if not data:
-        return "ok"
-    global scanner_running, win_count, loss_count
+        elif active_position:
+            # Есть открытая позиция — не сканируем
+            sym    = active_position["symbol"]
+            entry  = active_position["entry"]
+            price  = get_price(sym) or entry
+            profit = round((price-entry)/entry*100, 2)
+            print(f"[scanner_cycle] Позиция открыта: {sym} {profit}% — сканирование на паузе")
 
-    if "message" in data:
-        msg  = data["message"]
-        text = msg.get("text", "")
-        chat = msg["chat"]["id"]
+        time.sleep(SCAN_INTERVAL)
 
+# ──────────────────────────────────────────
+# КОМАНДЫ
+# ──────────────────────────────────────────
 
+def handle_message(text, chat_id):
+    global scanner_running
 
-        if text == "/start":
-            status   = "🟢 Включён" if scanner_running else "🔴 Выключен"
-            active_h = is_active_hours()
-            btc      = get_btc_trend()
-            btc_emoji = "🟢" if btc == "up" else ("🔴" if btc == "down" else "🟡")
-            send_message(chat, f"""🤖 <b>Ultra Binance Spot Scanner</b>
+    cmd = text.split("@")[0].strip().lower()
 
-Сканер: {status}
-Часы рынка: {"🟢 Активные" if active_h else "🟡 Тихие"}
-BTC тренд: {btc_emoji} {btc}
+    if cmd == "/start":
+        status     = "🟢 Работает" if scanner_running else "🔴 Остановлен"
+        pos_status = f"📈 Открыта: {active_position['symbol']}" if active_position else "📭 Нет позиций"
+        send_message(chat_id, f"""🤖 <b>Бот для SPOT торговли Binance запущен!</b>
 
-Команды:
+⚠️ Только спотовая торговля!
+Никаких фьючерсов и плеча!
+
+Статус сканера: {status}
+Позиция: {pos_status}
+
+<b>Команды:</b>
 /scan — запустить сканирование
-/stop — остановить
-/status — статус и статистика
-/active — мои позиции
-/history — история сделок
-/stats — винрейт
-/blacklist SYMBOL — добавить в чёрный список
-/ping — проверка""")
+/stop — остановить сканирование
+/status — статус бота
+/history — последние сигналы
+/active — активный сигнал
+/ping — проверка что бот жив""")
 
-        elif text == "/scan":
+    elif cmd == "/scan":
+        if active_position:
+            sym = active_position["symbol"]
+            send_message(chat_id,
+                f"⏸ <b>Сканирование на паузе</b>\n\n"
+                f"У тебя открыта позиция по <b>{sym}</b>\n"
+                f"Сначала продай монету — тогда начну искать новую!"
+            )
+        else:
             scanner_running = True
-            send_message(chat, "🚀 Сканирование <b>включено!</b>\nИщу сигналы каждые 5 минут...\n\n⏰ Активные часы: 14:00-22:00 UTC")
+            send_message(chat_id,
+                "🚀 <b>Сканирование включено!</b>\n\n"
+                f"Проверяю рынок каждые {SCAN_INTERVAL//60} минут.\n"
+                "Ищу только качественные сигналы — жди! 🔍"
+            )
+            # Запускаем сканирование сразу
+            threading.Thread(target=scan_market, daemon=True).start()
 
-        elif text == "/stop":
-            scanner_running = False
-            send_message(chat, "⛔ Сканирование <b>остановлено</b>")
+    elif cmd == "/stop":
+        scanner_running = False
+        send_message(chat_id, "⛔ <b>Сканирование остановлено</b>")
 
-        elif text == "/ping":
-            send_message(chat, "🏓 Бот работает нормально!")
+    elif cmd == "/ping":
+        now = datetime.now().strftime("%H:%M:%S")
+        send_message(chat_id, f"🏓 Бот живой! Время: {now}")
 
-        elif text == "/status":
-            status   = "🟢 Включён" if scanner_running else "🔴 Выключен"
-            btc      = get_btc_trend()
-            active_h = is_active_hours()
-            total    = win_count + loss_count
-            winrate  = round(win_count / total * 100) if total > 0 else 0
-            send_message(chat, f"""📊 <b>Статус бота</b>
+    elif cmd == "/status":
+        status    = "🟢 Работает" if scanner_running else "🔴 Остановлен"
+        btc_klines = get_klines("BTCUSDT","1h",10)
+        btc_price  = round(btc_klines["closes"][-1],0) if btc_klines else "N/A"
+        if active_position:
+            sym    = active_position["symbol"]
+            entry  = active_position["entry"]
+            price  = get_price(sym) or entry
+            profit = round((price-entry)/entry*100, 2)
+            pos_text = f"📈 <b>{sym}</b>: {profit}% (вход: {entry})"
+        else:
+            pos_text = "📭 Нет открытых позиций"
+        send_message(chat_id, f"""📊 <b>Статус бота</b>
 
 Сканер: {status}
-BTC тренд: {btc}
-Часы рынка: {"Активные ✅" if active_h else "Тихие ⏸"}
-Позиций открыто: {len(tracked_coins)}
-Сигналов в очереди: {len(active_signals)}
-Сделок в истории: {len(trade_history)}
-Винрейт: {winrate}% ({win_count}✅/{loss_count}❌)""")
+BTC: ${btc_price}
+Позиция: {pos_text}
+Сигналов найдено: {len(signal_history)}""")
 
-        elif text == "/active":
-            if tracked_coins:
-                msg_text = "📈 <b>Активные позиции:</b>\n\n"
-                for sym, d in tracked_coins.items():
-                    try:
-                        current = float(requests.get(
-                            f"{BINANCE_PRICE}?symbol={sym}", timeout=5
-                        ).json()["price"])
-                        pnl   = (current - d["entry"]) / d["entry"] * 100
-                        peak  = d.get("peak", d["entry"])
-                        pk_pnl = (peak - d["entry"]) / d["entry"] * 100
-                        emoji = "📈" if pnl > 0 else "📉"
-                        msg_text += f"{emoji} <b>{sym}</b>: {round(pnl,2)}% (пик: +{round(pk_pnl,2)}%)\n"
-                    except:
-                        msg_text += f"❓ {sym}: ошибка\n"
-                send_message(chat, msg_text)
-            else:
-                send_message(chat, "📭 Нет активных позиций")
+    elif cmd in ("/history", "/aktiv signal", "/active"):
+        if signal_history:
+            text_h = "📜 <b>Последние сигналы:</b>\n\n"
+            for s in reversed(signal_history[-10:]):
+                text_h += f"• <b>{s['symbol']}</b> @ {s['price']} | {s['score']} баллов | {s['time']}\n"
+            send_message(chat_id, text_h)
+        else:
+            send_message(chat_id, "📭 Сигналов ещё не было.\nЗапусти /scan чтобы найти первую монету!")
 
-        elif text == "/history":
-            if trade_history:
-                msg_text = "📜 <b>История последних сделок:</b>\n\n"
-                for trade in trade_history[-10:]:
-                    emoji = "✅" if trade["profit"] > 0 else "❌"
-                    msg_text += f"{emoji} {trade['symbol']}: {trade['profit']}%\n"
-                total_pnl = sum(t["profit"] for t in trade_history)
-                msg_text += f"\n💰 Суммарно: {round(total_pnl, 2)}%"
-                send_message(chat, msg_text)
-            else:
-                send_message(chat, "📭 История пуста")
-
-        # УЛУЧШЕНИЕ 9: статистика
-        elif text == "/stats":
-            total      = win_count + loss_count
-            winrate    = round(win_count / total * 100) if total > 0 else 0
-            avg_profit = round(sum(t["profit"] for t in trade_history) / len(trade_history), 2) if trade_history else 0
-            best       = max((t["profit"] for t in trade_history), default=0)
-            worst      = min((t["profit"] for t in trade_history), default=0)
-            send_message(chat, f"""📊 <b>Статистика торговли</b>
-
-Всего сделок: {total}
-Прибыльных: {win_count} ✅
-Убыточных: {loss_count} ❌
-Винрейт: <b>{winrate}%</b>
-
-Средняя сделка: {avg_profit}%
-Лучшая сделка: +{best}% 🏆
-Худшая сделка: {worst}%""")
-
-        # УЛУЧШЕНИЕ 6: blacklist
-        elif text and text.startswith("/blacklist "):
-            parts = text.split(" ")
-            if len(parts) > 1:
-                symbol = parts[1].upper()
-                if not symbol.endswith("USDT"):
-                    symbol += "USDT"
-                BLACKLIST.add(symbol)
-                send_message(chat, f"🚫 {symbol} добавлен в чёрный список\nВсего в блоке: {len(BLACKLIST)}")
-
-    if "callback_query" in data:
-
-
-        q           = data["callback_query"]["data"]
-        callback_id = data["callback_query"]["id"]
-
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery",
-            json={"callback_query_id": callback_id},
-            timeout=5
+    else:
+        send_message(chat_id,
+            "❓ Неизвестная команда.\n\n"
+            "/start — показать все команды"
         )
 
-        if q.startswith("buy_"):
-            symbol = q.split("_")[1]
-            try:
-                price = float(requests.get(
-                    f"{BINANCE_PRICE}?symbol={symbol}", timeout=10
-                ).json()["price"])
-                tracked_coins[symbol] = {"entry": price, "peak": price}
-                scanner_running = False
-                active_signals.clear()
-                send_message(OWNER_ID, f"""✅ <b>Позиция открыта!</b>
+def handle_callback(q, callback_id, chat_id):
+    global active_position, scanner_running
+
+    answer_callback(callback_id)
+
+    # Купить монету
+    if q.startswith("buy_"):
+        parts  = q.split("_")
+        symbol = parts[1]
+        try:
+            entry = float(parts[2])
+        except:
+            entry = get_price(symbol) or 0
+
+        active_position = {"symbol": symbol, "entry": entry, "peak": entry}
+        scanner_running = False  # пауза сканирования
+
+        tp = round(entry * (1+TAKE_PROFIT/100), 8)
+        sl = round(entry * (1+STOP_LOSS/100), 8)
+
+        send_message(OWNER_ID, f"""✅ <b>Позиция открыта!</b>
 
 Монета: <b>{symbol}</b>
-Цена входа: <b>{price} USDT</b>
-Стоп-лосс: <b>{round(price * 0.95, 8)} USDT (-5%)</b>
-Цель: <b>{round(price * 1.12, 8)} USDT (+12%)</b>
+Цена входа: <b>{entry} USDT</b>
+Цель: <b>{tp} USDT (+{TAKE_PROFIT}%)</b>
+Стоп-лосс: <b>{sl} USDT ({STOP_LOSS}%)</b>
 
 ⏸ Сканирование остановлено.
-Слежу только за {symbol}...
+Слежу только за <b>{symbol}</b>...
 Пришлю сигнал когда продавать! 👀""")
-            except Exception as e:
-                send_message(OWNER_ID, f"❌ Ошибка: {e}")
 
-        elif q.startswith("skip_"):
-            symbol = q.split("_")[1]
-            if symbol in active_signals:
-                active_signals.remove(symbol)
-            send_message(OWNER_ID, f"⏭ {symbol} пропущен\n🔍 Продолжаю поиск...")
+    # Отклонить сигнал
+    elif q.startswith("skip_"):
+        symbol = q.split("_")[1]
+        send_message(OWNER_ID,
+            f"⏭ <b>{symbol}</b> отклонён\n\n"
+            "🔍 Продолжаю поиск лучших вариантов..."
+        )
+        # Запускаем новое сканирование через паузу
+        def delayed_scan():
+            time.sleep(30)
+            if scanner_running and not active_position:
+                scan_market()
+        threading.Thread(target=delayed_scan, daemon=True).start()
 
-        elif q.startswith("sold_"):
-            symbol = q.split("_")[1]
-            if symbol in tracked_coins:
-                entry = tracked_coins[symbol]["entry"]
-                try:
-                    price  = float(requests.get(
-                        f"{BINANCE_PRICE}?symbol={symbol}", timeout=10
-                    ).json()["price"])
-                    profit = (price - entry) / entry * 100
-                    trade_history.append({
-                        "symbol": symbol,
-                        "entry":  entry,
-                        "exit":   price,
-                        "profit": round(profit, 2)
-                    })
-                    if profit > 0:
-                        win_count += 1
-                    else:
-                        loss_count += 1
+    # Продать монету
+    elif q.startswith("sold_"):
+        parts  = q.split("_")
+        symbol = parts[1]
+        try:
+            sell_price = float(parts[2])
+        except:
+            sell_price = get_price(symbol) or 0
 
-                    del tracked_coins[symbol]
-                    if symbol in active_signals:
-                        active_signals.remove(symbol)
+        if active_position and active_position["symbol"] == symbol:
+            entry  = active_position["entry"]
+            profit = round((sell_price-entry)/entry*100, 2)
+            emoji  = "✅" if profit > 0 else "❌"
 
-                    emoji = "✅" if profit > 0 else "❌"
-                    scanner_running = True
-                    total   = win_count + loss_count
-                    winrate = round(win_count / total * 100) if total > 0 else 0
+            signal_history.append({
+                "symbol": f"{symbol} ПРОДАНО",
+                "price":  sell_price,
+                "score":  profit,
+                "time":   datetime.now().strftime("%d.%m %H:%M"),
+            })
 
-                    send_message(OWNER_ID, f"""{emoji} <b>Сделка закрыта!</b>
+            active_position = None
+            scanner_running = True
 
-Монета: {symbol}
+            send_message(OWNER_ID, f"""{emoji} <b>Сделка закрыта!</b>
+
+Монета: <b>{symbol}</b>
 Вход: {entry} USDT
-Выход: {price} USDT
-Результат: <b>{round(profit, 2)}%</b>
+Выход: <b>{sell_price} USDT</b>
+Результат: <b>{'+' if profit>0 else ''}{profit}%</b>
 
-📊 Винрейт: {winrate}% ({win_count}✅/{loss_count}❌)
-
-🔍 Сканирование возобновлено!
+🔍 <b>Сканирование возобновлено!</b>
 Ищу следующую монету...""")
-                except Exception as e:
-                    send_message(OWNER_ID, f"❌ Ошибка закрытия: {e}")
 
-    return "ok"
+            # Сразу начинаем поиск
+            threading.Thread(target=scan_market, daemon=True).start()
 
-# ---------------- ПОТОКИ ---------------- #
+        else:
+            send_message(OWNER_ID, f"✅ {symbol} продан. Ищу новую монету...")
+            active_position = None
+            scanner_running = True
+            threading.Thread(target=scan_market, daemon=True).start()
 
-def run():
-    threading.Thread(target=scanner, daemon=True).start()
-    threading.Thread(target=tracker, daemon=True).start()
+# ──────────────────────────────────────────
+# POLLING LOOP
+# ──────────────────────────────────────────
 
-# ---------------- ЗАПУСК ---------------- #
+def polling_loop():
+    global last_update_id
 
-def delayed_start():
-    """Запускаем webhook и сканер после старта Flask"""
-    time.sleep(3)
-    set_webhook()
-    run()
+    delete_webhook()
+    time.sleep(2)
+
+    # Запускаем фоновые потоки
+    threading.Thread(target=scanner_cycle, daemon=True).start()
+    threading.Thread(target=track_position, daemon=True).start()
+
+    print("[scanner] ✅ Polling запущен!")
+    send_message(OWNER_ID,
+        "🤖 <b>Спот Бот запущен!</b>\n\n"
+        "Напиши /scan чтобы начать сканирование рынка!\n"
+        "Ищу только КАЧЕСТВЕННЫЕ сигналы 💎"
+    )
+
+    while True:
+        try:
+            updates = get_updates()
+            for update in updates:
+                last_update_id = update["update_id"]
+
+                if "message" in update:
+                    msg  = update["message"]
+                    text = msg.get("text","")
+                    chat = msg["chat"]["id"]
+                    if text:
+                        handle_message(text, chat)
+
+                elif "callback_query" in update:
+                    q    = update["callback_query"]["data"]
+                    cid  = update["callback_query"]["id"]
+                    chat = update["callback_query"]["message"]["chat"]["id"]
+                    handle_callback(q, cid, chat)
+
+        except Exception as e:
+            print(f"[scanner] polling error: {e}")
+            time.sleep(5)
+
+        time.sleep(1)
 
 if __name__ == "__main__":
-    print("🚀 Запуск Ultra Spot Scanner v2.0...")
-    PORT = int(os.environ.get("PORT", 10000))
-    threading.Thread(target=delayed_start, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    polling_loop()
