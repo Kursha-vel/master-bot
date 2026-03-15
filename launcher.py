@@ -15,36 +15,12 @@ import threading
 import asyncio
 import os
 import time
-import sys
-from flask import Flask
+from flask import Flask, request
 
 # ──────────────────────────────────────────────
-# HEALTH SERVER (Render требует открытый порт)
+# HEALTH SERVER + WEBHOOK РОУТЕР
 # ──────────────────────────────────────────────
 health_app = Flask(__name__)
-
-@health_app.route("/")
-def health():
-    status = []
-    for name, running in bot_status.items():
-        icon = "✅" if running else "❌"
-        status.append(f"{icon} {name}")
-    return "<br>".join(["<h2>🤖 Master Bot Launcher</h2>"] + status)
-
-@health_app.route("/tiktok", methods=["GET", "POST"])
-def tiktok_webhook():
-    import tiktok_main as tm
-    return tm.webhook()
-
-@health_app.route("/scanner", methods=["GET", "POST"])
-def scanner_webhook():
-    import scanner_main as sm
-    return sm.webhook()
-
-@health_app.route("/meta", methods=["GET", "POST"])
-def meta_webhook():
-    import meta_main as mm
-    return mm.webhook()
 
 bot_status = {
     "football-bot": False,
@@ -54,6 +30,41 @@ bot_status = {
     "meta-bot":     False,
     "tiktok-bot":   False,
 }
+
+@health_app.route("/")
+def health():
+    status = []
+    for name, running in bot_status.items():
+        icon = "✅" if running else "❌"
+        status.append(f"{icon} {name}")
+    return "<br>".join(["<h2>🤖 Master Bot Launcher</h2>"] + status)
+
+@health_app.route("/scanner", methods=["GET", "POST"])
+def scanner_webhook():
+    try:
+        import scanner_main as sm
+        return sm.webhook()
+    except Exception as e:
+        print(f"[scanner webhook] ошибка: {e}")
+        return "ok"
+
+@health_app.route("/meta", methods=["GET", "POST"])
+def meta_webhook():
+    try:
+        import meta_main as mm
+        return mm.webhook()
+    except Exception as e:
+        print(f"[meta webhook] ошибка: {e}")
+        return "ok"
+
+@health_app.route("/tiktok", methods=["GET", "POST"])
+def tiktok_webhook():
+    try:
+        import tiktok_main as tm
+        return tm.webhook()
+    except Exception as e:
+        print(f"[tiktok webhook] ошибка: {e}")
+        return "ok"
 
 # ──────────────────────────────────────────────
 # УТИЛИТЫ
@@ -76,102 +87,147 @@ def run_thread(name, func):
     t.start()
     return t
 
-def run_ptb_thread(name, build_func):
-    """Запускает PTB бота в отдельном потоке с собственным event loop"""
+def run_ptb_bot(name, token_env, build_handlers_func):
+    """
+    Правильный запуск PTB v20 бота в отдельном потоке.
+    Каждый бот получает свой event loop.
+    """
     def wrapper():
         while True:
             try:
                 print(f"[{name}] ▶ Запускаю PTB бота...")
                 bot_status[name] = True
+
+                token = os.environ.get(token_env, "")
+                if not token:
+                    raise ValueError(f"{token_env} не задан!")
+
+                # Создаём новый event loop для этого потока
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                ptb_app = build_func()
-                ptb_app.run_polling(drop_pending_updates=True)
+
+                from telegram.ext import Application
+                ptb_app = Application.builder().token(token).build()
+
+                # Добавляем хендлеры через переданную функцию
+                build_handlers_func(ptb_app)
+
+                print(f"[{name}] ✅ Построен, запускаю polling...")
+                ptb_app.run_polling(
+                    drop_pending_updates=True,
+                    close_loop=False
+                )
+
             except Exception as e:
                 bot_status[name] = False
                 print(f"[{name}] ❌ Упал: {e}")
                 print(f"[{name}] ⏳ Рестарт через 30 сек...")
                 time.sleep(30)
+
     t = threading.Thread(target=wrapper, daemon=True, name=name)
     t.start()
     return t
 
 # ══════════════════════════════════════════════
-# БОТ 1: FOOTBALL ANALYZER
+# БОТ 1: FOOTBALL ANALYZER (PTB polling)
 # ══════════════════════════════════════════════
 
-def build_football_bot():
-    from telegram.ext import Application, CommandHandler, CallbackQueryHandler
+def setup_football_handlers(ptb_app):
+    from telegram.ext import CommandHandler, CallbackQueryHandler
     import football_main as fb
 
-    token = os.environ.get("FOOTBALL_TOKEN", "")
-    if not token:
-        raise ValueError("FOOTBALL_TOKEN не задан!")
-
-    app = Application.builder().token(token).build()
     bot = fb.FootballBot()
-    app.bot_data['bot'] = bot
-    app.add_handler(CommandHandler("start", bot.start))
-    app.add_handler(CommandHandler("users", fb.admin_users))
-    app.add_handler(CommandHandler("revoke", fb.admin_revoke))
-    app.add_handler(CallbackQueryHandler(fb.handler))
-    print("[football-bot] ✅ Построен")
-    return app
+    ptb_app.bot_data['bot'] = bot
+    ptb_app.add_handler(CommandHandler("start", bot.start))
+    ptb_app.add_handler(CommandHandler("users", fb.admin_users))
+    ptb_app.add_handler(CommandHandler("revoke", fb.admin_revoke))
+    ptb_app.add_handler(CallbackQueryHandler(fb.handler))
+    print("[football-bot] ✅ Хендлеры добавлены")
+
+def start_football_bot():
+    run_ptb_bot("football-bot", "FOOTBALL_TOKEN", setup_football_handlers)
 
 # ══════════════════════════════════════════════
-# БОТ 2: CRYPTO SCALPER
+# БОТ 2: CRYPTO SCALPER (polling loop)
 # ══════════════════════════════════════════════
 
 def start_scalper_bot():
-    import scalper_main as sc
-    print("[scalper-bot] ✅ Запускаю polling loop...")
-    sc.polling_loop()
+    try:
+        import scalper_main as sc
+        bot_status["scalper-bot"] = True
+        print("[scalper-bot] ✅ Запускаю polling loop...")
+        sc.polling_loop()
+    except Exception as e:
+        bot_status["scalper-bot"] = False
+        print(f"[scalper-bot] ❌ {e}")
+        raise
 
 # ══════════════════════════════════════════════
 # БОТ 3: CRYPTO SCANNER (Flask webhook)
 # ══════════════════════════════════════════════
 
 def start_scanner_bot():
-    import scanner_main as sm
-    print("[scanner-bot] ✅ Scanner бот загружен (webhook через главный порт)")
-    # Держим поток живым
-    while True:
-        time.sleep(3600)
+    try:
+        import scanner_main as sm
+        bot_status["scanner-bot"] = True
+        print("[scanner-bot] ✅ Scanner загружен (webhook: /scanner)")
+        # Регистрируем webhook
+        sm.set_webhook()
+        # Держим поток живым
+        while True:
+            time.sleep(3600)
+    except Exception as e:
+        bot_status["scanner-bot"] = False
+        print(f"[scanner-bot] ❌ {e}")
+        raise
 
 # ══════════════════════════════════════════════
-# БОТ 4: NEURO ACADEMY
+# БОТ 4: NEURO ACADEMY (PTB polling)
 # ══════════════════════════════════════════════
 
-def build_neuro_bot():
+def setup_neuro_handlers(ptb_app):
     import neuro_main as nm
-    token = os.environ.get("NEURO_TOKEN", "")
-    if not token:
-        raise ValueError("NEURO_TOKEN не задан!")
-    app = nm.build_app(token)
-    print("[neuro-bot] ✅ Построен")
-    return app
+    nm.setup_handlers(ptb_app)
+    print("[neuro-bot] ✅ Хендлеры добавлены")
+
+def start_neuro_bot():
+    run_ptb_bot("neuro-bot", "NEURO_TOKEN", setup_neuro_handlers)
 
 # ══════════════════════════════════════════════
 # БОТ 5: META BOT (Flask webhook)
 # ══════════════════════════════════════════════
 
 def start_meta_bot():
-    import meta_main as mm
-    print("[meta-bot] ✅ Meta бот загружен (webhook через главный порт)")
-    while True:
-        time.sleep(3600)
+    try:
+        import meta_main as mm
+        bot_status["meta-bot"] = True
+        print("[meta-bot] ✅ Meta загружен (webhook: /meta)")
+        # Держим поток живым
+        while True:
+            time.sleep(3600)
+    except Exception as e:
+        bot_status["meta-bot"] = False
+        print(f"[meta-bot] ❌ {e}")
+        raise
 
 # ══════════════════════════════════════════════
 # БОТ 6: TIKTOK GENERATOR (Flask webhook)
 # ══════════════════════════════════════════════
 
 def start_tiktok_bot():
-    import tiktok_main as tm
-    print("[tiktok-bot] ✅ TikTok бот загружен (webhook через главный порт)")
-    # Регистрируем webhook
-    tm.set_webhook()
-    while True:
-        time.sleep(3600)
+    try:
+        import tiktok_main as tm
+        bot_status["tiktok-bot"] = True
+        print("[tiktok-bot] ✅ TikTok загружен (webhook: /tiktok)")
+        # Регистрируем webhook
+        tm.set_webhook()
+        # Держим поток живым
+        while True:
+            time.sleep(3600)
+    except Exception as e:
+        bot_status["tiktok-bot"] = False
+        print(f"[tiktok-bot] ❌ {e}")
+        raise
 
 # ══════════════════════════════════════════════
 # ЗАПУСК ВСЕХ БОТОВ
@@ -183,68 +239,25 @@ def start_all_bots():
     print("🚀 MASTER LAUNCHER — Запускаю все боты...")
     print("=" * 60)
 
-    bots_started = 0
+    bots = [
+        ("football-bot", start_football_bot),
+        ("scalper-bot",  start_scalper_bot),
+        ("scanner-bot",  start_scanner_bot),
+        ("neuro-bot",    start_neuro_bot),
+        ("meta-bot",     start_meta_bot),
+        ("tiktok-bot",   start_tiktok_bot),
+    ]
 
-    # Бот 1: Football (PTB polling)
-    try:
-        run_ptb_thread("football-bot", build_football_bot)
-        bots_started += 1
-        print("[1/6] ✅ Football Bot — запущен")
-    except Exception as e:
-        print(f"[1/6] ❌ Football Bot — ошибка: {e}")
-
-    time.sleep(2)
-
-    # Бот 2: Scalper (polling loop)
-    try:
-        run_thread("scalper-bot", start_scalper_bot)
-        bots_started += 1
-        print("[2/6] ✅ Crypto Scalper — запущен")
-    except Exception as e:
-        print(f"[2/6] ❌ Crypto Scalper — ошибка: {e}")
-
-    time.sleep(2)
-
-    # Бот 3: Scanner (Flask)
-    try:
-        run_thread("scanner-bot", start_scanner_bot)
-        bots_started += 1
-        print("[3/6] ✅ Crypto Scanner — запущен")
-    except Exception as e:
-        print(f"[3/6] ❌ Crypto Scanner — ошибка: {e}")
-
-    time.sleep(2)
-
-    # Бот 4: Neuro Academy (PTB polling)
-    try:
-        run_ptb_thread("neuro-bot", build_neuro_bot)
-        bots_started += 1
-        print("[4/6] ✅ Neuro Academy — запущен")
-    except Exception as e:
-        print(f"[4/6] ❌ Neuro Academy — ошибка: {e}")
-
-    time.sleep(2)
-
-    # Бот 5: Meta Bot (Flask)
-    try:
-        run_thread("meta-bot", start_meta_bot)
-        bots_started += 1
-        print("[5/6] ✅ Meta Bot — запущен")
-    except Exception as e:
-        print(f"[5/6] ❌ Meta Bot — ошибка: {e}")
-
-    time.sleep(2)
-
-    # Бот 6: TikTok Generator (Flask)
-    try:
-        run_thread("tiktok-bot", start_tiktok_bot)
-        bots_started += 1
-        print("[6/6] ✅ TikTok Bot — запущен")
-    except Exception as e:
-        print(f"[6/6] ❌ TikTok Bot — ошибка: {e}")
+    for i, (name, func) in enumerate(bots, 1):
+        try:
+            run_thread(name, func)
+            print(f"[{i}/6] ✅ {name} — запущен")
+        except Exception as e:
+            print(f"[{i}/6] ❌ {name} — ошибка: {e}")
+        time.sleep(2)  # пауза между запусками
 
     print("=" * 60)
-    print(f"✅ Запущено ботов: {bots_started}/6")
+    print("✅ Все боты запущены!")
     print("=" * 60)
 
 # ══════════════════════════════════════════════
@@ -257,6 +270,6 @@ if __name__ == "__main__":
     # Запускаем всех ботов в фоне
     threading.Thread(target=start_all_bots, daemon=True).start()
 
-    # Health server на главном порту (Render требует!)
-    print(f"[health] 🌐 Запускаю health server на порту {PORT}...")
+    # Health server + webhook роутер на главном порту
+    print(f"[health] 🌐 Запускаю сервер на порту {PORT}...")
     health_app.run(host="0.0.0.0", port=PORT)
