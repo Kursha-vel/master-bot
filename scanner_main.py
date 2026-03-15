@@ -83,7 +83,15 @@ def get_updates():
         data = r.json()
         if data.get("ok"):
             return data.get("result", [])
+        # Если Conflict — бросаем исключение чтобы выйти из polling
+        if not data.get("ok") and "Conflict" in str(data.get("description","")):
+            raise Exception(f"Conflict: {data.get('description')}")
+    except requests.exceptions.Timeout:
+        pass
     except Exception as e:
+        if "Conflict" in str(e):
+            print(f"[scanner] Conflict обнаружен — выхожу из polling: {e}")
+            raise
         print(f"[scanner] getUpdates error: {e}")
     return []
 
