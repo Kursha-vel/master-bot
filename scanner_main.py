@@ -811,47 +811,64 @@ def handle_callback(q, callback_id, chat_id):
 # POLLING LOOP
 # ──────────────────────────────────────────
 
+# Глобальная защита от двойного запуска
+_polling_running = False
+_polling_lock = threading.Lock()
+
 def polling_loop():
-    global last_update_id
+    global last_update_id, _polling_running
 
-    delete_webhook()
-    time.sleep(2)
+    # Защита от двойного запуска
+    with _polling_lock:
+        if _polling_running:
+            print("[scanner] ⚠️ Polling уже запущен — выхожу!")
+            return
+        _polling_running = True
 
-    # Запускаем фоновые потоки
-    threading.Thread(target=scanner_cycle, daemon=True).start()
-    threading.Thread(target=track_position, daemon=True).start()
+    try:
+        delete_webhook()
+        time.sleep(3)
 
-    print("[scanner] ✅ Polling запущен!")
-    send_message(OWNER_ID,
-        "🤖 <b>Спот Бот запущен!</b>\n\n"
-        "Напиши /scan чтобы начать сканирование рынка!\n"
-        "Ищу только КАЧЕСТВЕННЫЕ сигналы 💎"
-    )
+        # Запускаем фоновые потоки только один раз
+        threading.Thread(target=scanner_cycle, daemon=True).start()
+        threading.Thread(target=track_position, daemon=True).start()
 
-    while True:
-        try:
-            updates = get_updates()
-            for update in updates:
-                last_update_id = update["update_id"]
+        print("[scanner] ✅ Polling запущен!")
+        send_message(OWNER_ID,
+            "🤖 <b>Спот Бот запущен!</b>\n\n"
+            "Напиши /scan чтобы начать сканирование рынка!\n"
+            "Ищу только КАЧЕСТВЕННЫЕ сигналы 💎"
+        )
 
-                if "message" in update:
-                    msg  = update["message"]
-                    text = msg.get("text","")
-                    chat = msg["chat"]["id"]
-                    if text:
-                        handle_message(text, chat)
+        while True:
+            try:
+                updates = get_updates()
+                for update in updates:
+                    last_update_id = update["update_id"]
 
-                elif "callback_query" in update:
-                    q    = update["callback_query"]["data"]
-                    cid  = update["callback_query"]["id"]
-                    chat = update["callback_query"]["message"]["chat"]["id"]
-                    handle_callback(q, cid, chat)
+                    if "message" in update:
+                        msg  = update["message"]
+                        text = msg.get("text","")
+                        chat = msg["chat"]["id"]
+                        if text:
+                            handle_message(text, chat)
 
-        except Exception as e:
-            print(f"[scanner] polling error: {e}")
-            time.sleep(5)
+                    elif "callback_query" in update:
+                        q    = update["callback_query"]["data"]
+                        cid  = update["callback_query"]["id"]
+                        chat = update["callback_query"]["message"]["chat"]["id"]
+                        handle_callback(q, cid, chat)
 
-        time.sleep(1)
+            except Exception as e:
+                print(f"[scanner] polling error: {e}")
+                time.sleep(5)
+
+            time.sleep(1)
+
+    finally:
+        with _polling_lock:
+            _polling_running = False
+        print("[scanner] Polling остановлен")
 
 if __name__ == "__main__":
     polling_loop()
