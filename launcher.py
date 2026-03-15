@@ -19,6 +19,18 @@ bot_status = {
     "tiktok-bot":   False,
 }
 
+# Защита от двойного запуска
+_started = set()
+_started_lock = threading.Lock()
+
+def already_started(name):
+    with _started_lock:
+        if name in _started:
+            print(f"[{name}] ⚠️ Уже запущен — пропускаю!")
+            return True
+        _started.add(name)
+        return False
+
 @health_app.route("/")
 def health():
     rows = [f"<tr><td>{'✅' if v else '❌'}</td><td>{k}</td></tr>"
@@ -74,6 +86,8 @@ async def run_ptb_async(token, setup_func):
         await asyncio.sleep(3600)
 
 def ptb_thread(name, token_env, setup_func):
+    if already_started(name):
+        return
     def run():
         # Ждём чтобы не конфликтовать с другими ботами при старте
         time.sleep(1)
@@ -102,6 +116,8 @@ def ptb_thread(name, token_env, setup_func):
 # ──────────────────────────────────────────────
 
 def simple_thread(name, func):
+    if already_started(name):
+        return
     def run():
         while True:
             try:
@@ -111,8 +127,8 @@ def simple_thread(name, func):
             except Exception as e:
                 bot_status[name] = False
                 print(f"[{name}] ❌ Упал: {e}")
-                print(f"[{name}] ⏳ Рестарт через 30 сек...")
-                time.sleep(30)
+                print(f"[{name}] ⏳ Рестарт через 60 сек...")
+                time.sleep(60)
     t = threading.Thread(target=run, daemon=True, name=name)
     t.start()
 
