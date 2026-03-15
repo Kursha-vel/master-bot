@@ -75,6 +75,8 @@ async def run_ptb_async(token, setup_func):
 
 def ptb_thread(name, token_env, setup_func):
     def run():
+        # Ждём чтобы не конфликтовать с другими ботами при старте
+        time.sleep(1)
         while True:
             try:
                 token = os.environ.get(token_env, "")
@@ -88,9 +90,11 @@ def ptb_thread(name, token_env, setup_func):
             except Exception as e:
                 bot_status[name] = False
                 print(f"[{name}] ❌ Упал: {e}")
-                print(f"[{name}] ⏳ Рестарт через 30 сек...")
-                time.sleep(30)
+                # Долгая пауза перед рестартом чтобы не спамить
+                print(f"[{name}] ⏳ Рестарт через 60 сек...")
+                time.sleep(60)
     t = threading.Thread(target=run, daemon=True, name=name)
+    t.daemon = True
     t.start()
 
 # ──────────────────────────────────────────────
@@ -195,20 +199,21 @@ def start_all_bots():
     print("🚀 MASTER LAUNCHER v3 — Запускаю все боты...")
     print("=" * 55)
 
-    # PTB боты (asyncio.run в своём потоке)
+    # PTB боты — запускаем напрямую через ptb_thread (у них свой рестарт)
     ptb_thread("football-bot", "FOOTBALL_TOKEN", setup_football)
-    time.sleep(3)
+    time.sleep(5)  # больше паузы чтобы не конфликтовали
 
     ptb_thread("neuro-bot", "NEURO_TOKEN", setup_neuro)
+    time.sleep(5)
+
+    # Polling боты
+    simple_thread("scalper-bot", start_scalper)
     time.sleep(3)
 
-    # Обычные боты
-    simple_thread("scalper-bot", start_scalper)
-    time.sleep(2)
-
     simple_thread("scanner-bot", start_scanner)
-    time.sleep(2)
+    time.sleep(3)
 
+    # Фоновые боты (держат потоки живыми)
     simple_thread("meta-bot", start_meta)
     time.sleep(2)
 
