@@ -51,7 +51,7 @@ def set_webhook():
         return
     url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
     try:
-        r = requests.post(url, json={"url": RENDER_URL.rstrip("/") + "/"}, timeout=10)
+        r = requests.post(url, json={"url": RENDER_URL.rstrip("/") + "/scanner"}, timeout=10)
         print(f"Webhook: {r.json()}")
     except Exception as e:
         print(f"Ошибка webhook: {e}")
@@ -63,13 +63,15 @@ def get_klines(symbol, interval, limit=40):
         url = f"{BINANCE_KLINES}?symbol={symbol}&interval={interval}&limit={limit}"
         data = requests.get(url, timeout=10).json()
         if not isinstance(data, list) or len(data) < 5:
-            return [], []
+            return [], [], [], []
+        highs   = [float(x[2]) for x in data]
+        lows    = [float(x[3]) for x in data]
         closes  = [float(x[4]) for x in data]
         volumes = [float(x[5]) for x in data]
-        return closes, volumes
+        return closes, volumes, highs, lows
     except Exception as e:
         print(f"Ошибка klines {symbol}: {e}")
-        return [], []
+        return [], [], [], []
 
 def get_top_pairs():
     try:
@@ -100,7 +102,7 @@ def get_top_pairs():
 
 def get_btc_trend():
     try:
-        closes, _ = get_klines("BTCUSDT", "1h")
+        closes, _, _, _ = get_klines("BTCUSDT", "1h")
         if not closes or len(closes) < 6:
             return "neutral"
         change = (closes[-1] - closes[-6]) / closes[-6] * 100
@@ -114,7 +116,7 @@ def get_btc_trend():
 
 def check_btc_crash():
     try:
-        closes, _ = get_klines("BTCUSDT", "15m")
+        closes, _, _, _ = get_klines("BTCUSDT", "15m")
         if not closes or len(closes) < 5:
             return False
         drop = (closes[-1] - closes[-5]) / closes[-5] * 100
@@ -206,7 +208,7 @@ def multi_timeframe_trend(symbol):
     score = 0
     for interval in ["15m", "1h", "4h"]:
         try:
-            closes, _ = get_klines(symbol, interval, limit=20)
+            closes, _, _, _ = get_klines(symbol, interval, limit=20)
             if closes and len(closes) >= 5:
                 trend = (closes[-1] - closes[0]) / closes[0] * 100
                 if trend > 0:
@@ -215,13 +217,61 @@ def multi_timeframe_trend(symbol):
             pass
     return score  # 0-3
 
+# SUPERTREND
+def calc_supertrend(highs, lows, closes, period=10, multiplier=3.0):
+    """Supertrend — популярный индикатор тренда с TradingView"""
+    if len(closes) < period + 1:
+        return "neutral"
+    # ATR
+    tr_list = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i-1]),
+            abs(lows[i] - closes[i-1])
+        )
+        tr_list.append(tr)
+    if len(tr_list) < period:
+        return "neutral"
+    atr = sum(tr_list[-period:]) / period
+    # Basic bands
+    hl2 = [(highs[i] + lows[i]) / 2 for i in range(len(closes))]
+    upper = hl2[-1] + multiplier * atr
+    lower = hl2[-1] - multiplier * atr
+    # Определяем направление
+    if closes[-1] > lower:
+        return "up"    # цена выше нижней полосы = восходящий тренд
+    elif closes[-1] < upper:
+        return "down"  # цена ниже верхней полосы = нисходящий тренд
+    return "neutral"
+
+# VWAP
+def calc_vwap(closes, volumes):
+    """VWAP — средневзвешенная цена по объёму"""
+    if not closes or not volumes or len(closes) != len(volumes):
+        return None
+    total_pv = sum(closes[i] * volumes[i] for i in range(len(closes)))
+    total_v  = sum(volumes)
+    if total_v == 0:
+        return None
+    return total_pv / total_v
+
+# SUPPORT / RESISTANCE
+def calc_support_resistance(closes, highs, lows):
+    """Автоматические уровни поддержки и сопротивления"""
+    if len(closes) < 10:
+        return None, None
+    support    = min(lows[-10:])
+    resistance = max(highs[-10:])
+    return support, resistance
+
 # ---------------- АНАЛИЗ ---------------- #
 
 def analyze(symbol, trending_symbols):
-    closes5,  vol5  = get_klines(symbol, "5m")
-    closes15, vol15 = get_klines(symbol, "15m")
+    closes5,  vol5,  highs5,  lows5  = get_klines(symbol, "5m")
+    closes15, vol15, highs15, lows15 = get_klines(symbol, "15m")
 
-    if not closes5 or not vol5 or not closes15:
+    if not closes5 or not vol5 or not closes15 or not highs15 or not lows15:
         return 0, {}
 
     whale        = whale_tracker(vol5)
@@ -233,6 +283,13 @@ def analyze(symbol, trending_symbols):
     macd_cross   = calc_macd(closes15)
     mtf_score    = multi_timeframe_trend(symbol)
     is_trending  = symbol in trending_symbols
+    # Новые индикаторы TradingView уровня
+    supertrend   = calc_supertrend(highs15, lows15, closes15)
+    vwap         = calc_vwap(closes15, vol15)
+    support, resistance = calc_support_resistance(closes15, highs15, lows15)
+    price_now    = closes15[-1]
+    above_vwap   = vwap is not None and price_now > vwap
+    near_support = support is not None and abs(price_now - support) / price_now < 0.02
 
     # УЛУЧШЕНИЕ 2: малые монеты
     is_small_cap = False
@@ -258,14 +315,26 @@ def analyze(symbol, trending_symbols):
     score += mtf_score * 10
     if is_small_cap:     score += 10
     if is_trending:      score += 15
+    # Supertrend
+    if supertrend == "up":    score += 25   # сильный сигнал тренда
+    elif supertrend == "down": score -= 20  # против тренда — штраф
+    # VWAP
+    if above_vwap:       score += 15   # цена выше VWAP = бычий сигнал
+    # Поддержка
+    if near_support:     score += 15   # цена у поддержки = хорошая точка входа
 
     details = {
-        "rsi":      round(rsi, 1),
-        "macd":     macd_cross,
-        "whale":    round(whale, 1),
-        "pressure": round(pressure, 2),
-        "mtf":      mtf_score,
-        "trending": is_trending,
+        "rsi":        round(rsi, 1),
+        "macd":       macd_cross,
+        "whale":      round(whale, 1),
+        "pressure":   round(pressure, 2),
+        "mtf":        mtf_score,
+        "trending":   is_trending,
+        "supertrend": supertrend,
+        "vwap":       round(vwap, 6) if vwap else None,
+        "above_vwap": above_vwap,
+        "support":    round(support, 6) if support else None,
+        "near_support": near_support,
     }
     return score, details
 
@@ -276,12 +345,15 @@ def send_signal(symbol, price, score, details):
     elif score >= 75:  strength = "🔥🔥 СИЛЬНЫЙ"
     else:              strength = "🔥 СРЕДНИЙ"
 
-    rsi_text  = f"{details['rsi']} {'🟢 перепродана' if details['rsi'] < 40 else '🟡 норма'}"
-    macd_text = "✅ Да" if details["macd"] else "➖ Нет"
+    rsi_text   = f"{details['rsi']} {'🟢 перепродана' if details['rsi'] < 40 else '🟡 норма'}"
+    macd_text  = "✅ Да" if details["macd"] else "➖ Нет"
     whale_text = f"x{details['whale']} {'🐋' if details['whale'] > 3 else ''}"
     press_text = f"{details['pressure']} {'✅' if details['pressure'] > 1.3 else '➖'}"
-    mtf_text  = f"{details['mtf']}/3 таймфреймов вверх"
+    mtf_text   = f"{details['mtf']}/3 таймфреймов вверх"
     trend_text = "🔥 Trending!" if details["trending"] else "➖"
+    st_emoji   = "🟢 Вверх" if details["supertrend"] == "up" else ("🔴 Вниз" if details["supertrend"] == "down" else "🟡 Нейтрально")
+    vwap_text  = f"{details['vwap']} {'✅ Выше VWAP' if details['above_vwap'] else '⬇️ Ниже VWAP'}" if details["vwap"] else "➖"
+    sup_text   = f"{details['support']} {'🎯 Цена у поддержки!' if details['near_support'] else ''}" if details["support"] else "➖"
 
     text = f"""
 🚨 <b>СИГНАЛ ПОКУПКИ (СПОТ)</b>
@@ -291,13 +363,18 @@ def send_signal(symbol, price, score, details):
 Стоп-лосс: <b>{round(price * 0.95, 8)} USDT (-5%)</b>
 Цель: <b>{round(price * 1.12, 8)} USDT (+12%)</b>
 
-📊 <b>Анализ:</b>
+📊 <b>Базовый анализ:</b>
 • RSI: {rsi_text}
 • MACD crossover: {macd_text}
 • Объём кита: {whale_text}
 • Давление стакана: {press_text}
-• Тренд: {mtf_text}
+• Тренд МТФ: {mtf_text}
 • CoinGecko: {trend_text}
+
+📈 <b>TradingView индикаторы:</b>
+• Supertrend: {st_emoji}
+• VWAP: {vwap_text}
+• Поддержка: {sup_text}
 
 AI Score: <b>{score}</b>
 Сила сигнала: {strength}
@@ -462,7 +539,7 @@ def tracker():
 
 # ---------------- WEBHOOK ---------------- #
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/scanner", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
         return "✅ Ultra Spot Scanner работает!"
