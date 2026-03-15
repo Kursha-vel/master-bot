@@ -25,15 +25,6 @@ def health():
             for k, v in bot_status.items()]
     return f"<h2>🤖 Master Bot</h2><table>{''.join(rows)}</table>"
 
-@health_app.route("/scanner", methods=["GET", "POST"])
-def scanner_webhook():
-    try:
-        import scanner_main as sm
-        return sm.webhook()
-    except Exception as e:
-        print(f"[scanner] webhook error: {e}")
-        return "ok"
-
 @health_app.route("/meta", methods=["GET", "POST"])
 def meta_webhook():
     try:
@@ -57,6 +48,21 @@ def tiktok_webhook():
 # ──────────────────────────────────────────────
 
 async def run_ptb_async(token, setup_func):
+    import httpx
+    # Удаляем webhook перед polling чтобы не было конфликта
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/deleteWebhook",
+                json={"drop_pending_updates": True},
+                timeout=10
+            )
+            print(f"[ptb] deleteWebhook OK")
+    except Exception as e:
+        print(f"[ptb] deleteWebhook error: {e}")
+
+    await asyncio.sleep(2)
+
     from telegram.ext import Application
     app = Application.builder().token(token).build()
     setup_func(app)
@@ -156,10 +162,8 @@ def start_scalper():
 
 def start_scanner():
     import scanner_main as sm
-    print("[scanner-bot] ✅ Загружен (webhook: /scanner)")
-    sm.set_webhook()
-    while True:
-        time.sleep(3600)
+    print("[scanner-bot] ✅ Запускаю polling loop...")
+    sm.polling_loop()
 
 # ══════════════════════════════════════════════
 # БОТ 5: META BOT
