@@ -61,8 +61,8 @@ def run_once(name, func):
             except Exception as e:
                 bot_status[name] = False
                 print(f"[{name}] ❌ Ошибка: {e}")
-            print(f"[{name}] ⏳ Рестарт через 60 сек...")
-            time.sleep(60)
+            print(f"[{name}] ⏳ Рестарт через 90 сек (ждём закрытия Telegram соединений)...")
+            time.sleep(90)
     t = threading.Thread(target=wrapper, daemon=True, name=name)
     t.start()
     return t
@@ -112,8 +112,20 @@ def run_football():
 # ══════════════════════════════════════════════
 
 def run_scalper():
+    import requests as req
     import scalper_main as sc
-    print("[scalper-bot] ✅ Запускаю...")
+
+    token = os.environ.get("SCALPER_TOKEN", "")
+    if token:
+        try:
+            req.post(f"https://api.telegram.org/bot{token}/deleteWebhook",
+                     json={"drop_pending_updates": True}, timeout=10)
+            print("[scalper-bot] webhook удалён — жду 40 сек...")
+        except Exception as e:
+            print(f"[scalper-bot] deleteWebhook: {e}")
+        time.sleep(40)
+
+    print("[scalper-bot] ✅ Запускаю polling...")
     sc.polling_loop()
 
 # ══════════════════════════════════════════════
@@ -121,10 +133,26 @@ def run_scalper():
 # ══════════════════════════════════════════════
 
 def run_scanner():
+    import requests as req
     import scanner_main as sm
-    # Сбрасываем флаг перед каждым запуском
+
+    token = os.environ.get("TELEGRAM_TOKEN", "")
+    if not token:
+        print("[scanner-bot] ❌ TELEGRAM_TOKEN не задан!")
+        return
+
+    # Принудительно удаляем webhook и ждём закрытия старых соединений
+    try:
+        req.post(f"https://api.telegram.org/bot{token}/deleteWebhook",
+                 json={"drop_pending_updates": True}, timeout=10)
+        print("[scanner-bot] webhook удалён — жду 40 сек закрытия соединений...")
+    except Exception as e:
+        print(f"[scanner-bot] deleteWebhook: {e}")
+
+    time.sleep(40)  # Telegram держит соединение 30 сек — ждём дольше!
+
     sm._polling_running = False
-    print("[scanner-bot] ✅ Запускаю...")
+    print("[scanner-bot] ✅ Запускаю polling...")
     sm.polling_loop()
 
 # ══════════════════════════════════════════════
