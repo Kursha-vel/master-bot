@@ -835,7 +835,7 @@ def polling_loop():
 
     try:
         delete_webhook()
-        time.sleep(3)
+        time.sleep(40)  # Ждём закрытия старых Telegram соединений (30+ сек)
 
         # Запускаем фоновые потоки только один раз
         threading.Thread(target=scanner_cycle, daemon=True).start()
